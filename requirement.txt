@@ -1,8 +1,7 @@
 streamlit>=1.32
 openai>=1.40.0
-faiss-cpu==1.7.4
+faiss-cpu==1.7.2.post2
 numpy
 requests
 python-dotenv
 pandas>=2.0
-
