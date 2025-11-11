@@ -7,7 +7,17 @@ except Exception:
     pass
 
 import os, re, io, json, time, sqlite3, requests, numpy as np, streamlit as st, pandas as pd
-from openai import OpenAI
+# OpenAI client (SDK v1+). If missing, show a helpful error instead of crashing.
+try:
+    from openai import OpenAI
+except Exception as e:
+    import streamlit as st
+    st.error(
+        "The OpenAI SDK isn't available. Make sure `openai` is in requirements.txt "
+        "(e.g., `openai>=1.51.0`) and then Clear cache & Restart the app."
+    )
+    raise
+
 from typing import List, Dict, Any, Set, Optional
 
 # Vector store: ChromaDB (no FAISS)
@@ -433,3 +443,4 @@ if submitted:
         st.session_state.chat_history.append({"role": "user", "content": user_q, "ts": int(time.time())})
         st.session_state.chat_history.append({"role": "assistant", "content": ans, "ts": int(time.time())})
         st.rerun()
+
