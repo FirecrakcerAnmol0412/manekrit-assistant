@@ -1,23 +1,31 @@
 # app.py — ManeKrit (ChromaDB, mobile login, per-number history, project picker, admin)
+# Safe dotenv import so Streamlit Cloud won't crash if python-dotenv isn't present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 import os, re, io, json, time, sqlite3, requests, numpy as np, streamlit as st, pandas as pd
-from dotenv import load_dotenv
 from openai import OpenAI
 from typing import List, Dict, Any, Set, Optional
 
-# NEW: Chroma
+# Vector store: ChromaDB (no FAISS)
 import chromadb
 from chromadb.config import Settings
 
 # -------------------------------
 # 0) CONFIG / SECRETS
 # -------------------------------
-load_dotenv()
-
 def get_config(name: str, default: str = "") -> str:
-    val = os.getenv(name)
-    if val: return val
-    try: return st.secrets[name]
-    except Exception: return default
+    # Prefer Streamlit secrets; fallback to env (useful for local dev)
+    try:
+        val = st.secrets.get(name)  # type: ignore[attr-defined]
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
 OPENAI_API_KEY   = get_config("OPENAI_API_KEY")
 GDRIVE_API_KEY   = get_config("GDRIVE_API_KEY")
@@ -37,29 +45,37 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 DB_PATH = "conversations.sqlite"
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             mobile TEXT NOT NULL,
             ts INTEGER NOT NULL,
-            role TEXT NOT NULL,
+            role TEXT NOT NULL,   -- 'user' | 'assistant' | 'event'
             content TEXT NOT NULL
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_conv_mobile_ts ON conversations (mobile, ts)")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 def log_event(mobile: str, role: str, content: str):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("INSERT INTO conversations (mobile, ts, role, content) VALUES (?, ?, ?, ?)",
-              (mobile, int(time.time()), role, content))
-    conn.commit(); conn.close()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO conversations (mobile, ts, role, content) VALUES (?, ?, ?, ?)",
+        (mobile, int(time.time()), role, content),
+    )
+    conn.commit()
+    conn.close()
 
 def load_history(mobile: str) -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     c.execute("SELECT role, content, ts FROM conversations WHERE mobile=? ORDER BY ts ASC", (mobile,))
-    rows = c.fetchall(); conn.close()
+    rows = c.fetchall()
+    conn.close()
     return [{"role": r, "content": t, "ts": ts} for (r, t, ts) in rows if r in ("user", "assistant")]
 
 def load_all_df() -> pd.DataFrame:
@@ -83,18 +99,21 @@ def list_drive_files(folder_id: str, api_key: str):
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
     }
-    r = requests.get(url, params=params, timeout=30); r.raise_for_status()
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
     return r.json().get("files", [])
 
 def find_by_name(files, name: str):
     for f in files:
-        if f.get("name") == name: return f
+        if f.get("name") == name:
+            return f
     return None
 
 @st.cache_data(show_spinner=False)
 def download_drive_file_bytes(file_id: str, api_key: str) -> bytes:
     url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
-    r = requests.get(url, params={"alt":"media","key":api_key}, timeout=120); r.raise_for_status()
+    r = requests.get(url, params={"alt": "media", "key": api_key}, timeout=120)
+    r.raise_for_status()
     return r.content
 
 # -------------------------------
@@ -112,21 +131,15 @@ def load_chroma_collection(folder_id: str, api_key: str):
     emb_bytes  = download_drive_file_bytes(emb_f["id"], api_key)
 
     meta = json.loads(meta_bytes.decode("utf-8"))
-    embeddings = np.load(io.BytesIO(emb_bytes))  # shape (N, dim), float32
+    embeddings = np.load(io.BytesIO(emb_bytes))  # (N, dim) float32
 
-    # Build in-memory Chroma collection (we pass embeddings explicitly; no embedding_function)
-    client = chromadb.Client(Settings(
-        anonymized_telemetry=False,
-        is_persistent=False,  # memory only for speed
-    ))
-    coll = client.create_collection(name="manekrit", embedding_function=None)
+    # Build in-memory Chroma collection; we pass embeddings explicitly
+    cclient = chromadb.Client(Settings(anonymized_telemetry=False, is_persistent=False))
+    coll = cclient.create_collection(name="manekrit", embedding_function=None)
 
-    # Prepare documents, metadatas, ids
     documents = [m["text"] for m in meta]
     metadatas = [{"project": m["file"], "chunk_id": m["chunk_id"]} for m in meta]
     ids = [str(i) for i in range(len(meta))]
-
-    # Add with precomputed embeddings
     coll.add(documents=documents, metadatas=metadatas, ids=ids, embeddings=embeddings.tolist())
 
     return coll, meta
@@ -140,8 +153,6 @@ def embed_query(text: str) -> np.ndarray:
 
 def retrieve_filtered(query: str, coll, meta, k: int, allowed_projects: Set[str] | None):
     q = embed_query(query)
-
-    # get a larger pool for filtering
     CANDIDATES = max(50, k * 10)
     res = coll.query(query_embeddings=[q.tolist()], n_results=CANDIDATES)
     docs = res.get("documents", [[]])[0]
@@ -193,7 +204,7 @@ def answer_from_context(user_query: str, context_chunks: List[Dict[str, Any]]) -
     )
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
-        messages=[{"role":"system","content":system},{"role":"user","content":user}]
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
     )
     return resp.choices[0].message.content
 
@@ -253,32 +264,37 @@ if st.session_state.is_admin:
         else:
             df["ts_dt"] = pd.to_datetime(df["ts"], unit="s") + pd.to_timedelta(TZ_OFFSET, unit="h")
             df["date"] = df["ts_dt"].dt.date
-            messages = len(df[df["role"].isin(["user","assistant"])])
+            messages = len(df[df["role"].isin(["user", "assistant"])])
             users = df["mobile"].nunique()
             dau = df.groupby("date")["mobile"].nunique().iloc[-1] if not df.empty else 0
             avg_msgs = round(messages / users, 2) if users else 0.0
-            c1,c2,c3,c4 = st.columns(4)
+
+            c1, c2, c3, c4 = st.columns(4)
             c1.metric("Total messages", f"{messages}")
             c2.metric("Total users", f"{users}")
             c3.metric("DAU (today)", f"{dau}")
             c4.metric("Avg msgs / user", f"{avg_msgs}")
-            daily_msgs = df[df["role"].isin(["user","assistant"])].groupby("date").size().reset_index(name="messages")
+
+            daily_msgs = df[df["role"].isin(["user", "assistant"])].groupby("date").size().reset_index(name="messages")
             daily_users = df.groupby("date")["mobile"].nunique().reset_index(name="active_users")
+
             st.markdown("#### Messages per day"); st.line_chart(daily_msgs.set_index("date"))
             st.markdown("#### Active users per day"); st.line_chart(daily_users.set_index("date"))
-            # Top projects
-            ev = df[df["role"]=="event"]["content"].fillna("")
+
+            # Top projects from selection events
+            ev = df[df["role"] == "event"]["content"].fillna("")
             sel = ev[ev.str.startswith("project_selection:")]
             if not sel.empty:
-                proj_counts={}
+                proj_counts = {}
                 for row in sel:
-                    names_str = row.split("project_selection:",1)[1].strip()
-                    if names_str.lower().startswith("all projects"): continue
+                    names_str = row.split("project_selection:", 1)[1].strip()
+                    if names_str.lower().startswith("all projects"):
+                        continue
                     for nm in [x.strip() for x in names_str.split(",") if x.strip()]:
-                        proj_counts[nm] = proj_counts.get(nm,0)+1
+                        proj_counts[nm] = proj_counts.get(nm, 0) + 1
                 if proj_counts:
                     proj_df = pd.DataFrame(sorted(proj_counts.items(), key=lambda x: x[1], reverse=True),
-                                           columns=["project","selections"])
+                                           columns=["project", "selections"])
                     st.markdown("#### Top selected projects")
                     st.bar_chart(proj_df.set_index("project"))
                 else:
@@ -302,35 +318,42 @@ if st.session_state.is_admin:
             with cols[2]:
                 min_d, max_d = df["ts_dt"].dt.date.min(), df["ts_dt"].dt.date.max()
                 f_to = st.date_input("To", value=max_d)
+
             mask = (df["ts_dt"].dt.date >= f_from) & (df["ts_dt"].dt.date <= f_to)
-            if f_mobile != "(all)": mask &= (df["mobile"] == f_mobile)
-            fdf = df[mask].sort_values("ts_dt")[["ts_dt","mobile","role","content"]]
-            st.markdown("#### Messages"); st.dataframe(fdf, use_container_width=True, hide_index=True)
+            if f_mobile != "(all)":
+                mask &= (df["mobile"] == f_mobile)
+            fdf = df[mask].sort_values("ts_dt")[["ts_dt", "mobile", "role", "content"]]
+            st.markdown("#### Messages")
+            st.dataframe(fdf, use_container_width=True, hide_index=True)
+
             csv = fdf.to_csv(index=False).encode("utf-8")
             st.download_button("Download CSV", data=csv, file_name="manekrit_conversations.csv", mime="text/csv")
     st.stop()
 
 # --- User flow (authenticated) ---
 # Guard config
-missing=[]
-if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
-if not GDRIVE_API_KEY: missing.append("GDRIVE_API_KEY")
+missing = []
+if not OPENAI_API_KEY:   missing.append("OPENAI_API_KEY")
+if not GDRIVE_API_KEY:   missing.append("GDRIVE_API_KEY")
 if not GDRIVE_FOLDER_ID: missing.append("GDRIVE_FOLDER_ID")
-if missing: st.error("Configuration missing. Please set: " + ", ".join(missing)); st.stop()
+if missing:
+    st.error("Configuration missing. Please set: " + ", ".join(missing))
+    st.stop()
 
 # Load Chroma collection
 with st.spinner("Preparing knowledge base…"):
     coll, meta = load_chroma_collection(GDRIVE_FOLDER_ID, GDRIVE_API_KEY)
 if coll is None or meta is None:
-    st.error("Prebuilt files not found. Upload 'meta.json' and 'embeddings.npy' to Drive."); st.stop()
+    st.error("Prebuilt files not found. Upload 'meta.json' and 'embeddings.npy' to Drive.")
+    st.stop()
 
-# Build project list/map (strip .pdf)
+# Build project list/map (strip .pdf for display)
 if not st.session_state.project_names:
     file_names = sorted({m["file"] for m in meta})
     st.session_state.project_map = {fn: os.path.splitext(fn)[0] for fn in file_names}
     st.session_state.project_names = file_names
 
-# Project picker
+# Project picker (until confirmed)
 if not st.session_state.project_confirmed:
     st.markdown("### Which projects are you considering right now?")
     st.caption("Select one or more, or choose **None of the above** to ask general questions.")
@@ -340,24 +363,30 @@ if not st.session_state.project_confirmed:
         sel = internal in st.session_state.selected_projects
         label = f"✅ {disp}" if sel else disp
         if cols[i % 3].button(label, key=f"proj_{i}", use_container_width=True):
-            if sel: st.session_state.selected_projects.remove(internal)
+            if sel:
+                st.session_state.selected_projects.remove(internal)
             else:
                 if "NONE_OF_THE_ABOVE" in st.session_state.selected_projects:
                     st.session_state.selected_projects.remove("NONE_OF_THE_ABOVE")
                 st.session_state.selected_projects.add(internal)
     st.divider()
-    c1,c2 = st.columns([1,1])
+    c1, c2 = st.columns([1, 1])
     with c1:
         none_sel = "NONE_OF_THE_ABOVE" in st.session_state.selected_projects
         none_label = "✅ None of the above" if none_sel else "None of the above"
         if st.button(none_label, key="proj_none", type="secondary", use_container_width=True):
-            if none_sel: st.session_state.selected_projects.remove("NONE_OF_THE_ABOVE")
-            else: st.session_state.selected_projects = {"NONE_OF_THE_ABOVE"}
+            if none_sel:
+                st.session_state.selected_projects.remove("NONE_OF_THE_ABOVE")
+            else:
+                st.session_state.selected_projects = {"NONE_OF_THE_ABOVE"}
     with c2:
         if st.button("Continue", key="confirm_projects", type="primary", use_container_width=True):
             st.session_state.project_confirmed = True
-            chosen = ("All projects" if "NONE_OF_THE_ABOVE" in st.session_state.selected_projects or not st.session_state.selected_projects
-                      else ", ".join([st.session_state.project_map.get(fn, fn) for fn in sorted(st.session_state.selected_projects)]))
+            chosen = (
+                "All projects"
+                if "NONE_OF_THE_ABOVE" in st.session_state.selected_projects or not st.session_state.selected_projects
+                else ", ".join([st.session_state.project_map.get(fn, fn) for fn in sorted(st.session_state.selected_projects)])
+            )
             log_event(st.session_state.mobile, "event", f"project_selection: {chosen}")
             st.rerun()
     st.stop()
@@ -372,14 +401,17 @@ with left:
         st.caption("Project filter: **" + ", ".join(display_list) + "**")
 with right:
     if st.button("Change selection", key="change_selection_btn"):
-        st.session_state.project_confirmed = False; st.rerun()
+        st.session_state.project_confirmed = False
+        st.rerun()
 
 st.subheader("Chat")
 
-# Render past
+# Past messages
 for chat in st.session_state.chat_history:
-    if chat["role"] == "user": st.markdown(f"**You:** {chat['content']}")
-    elif chat["role"] == "assistant": st.markdown(f"**Advisor:** {chat['content']}")
+    if chat["role"] == "user":
+        st.markdown(f"**You:** {chat['content']}")
+    elif chat["role"] == "assistant":
+        st.markdown(f"**Advisor:** {chat['content']}")
 
 # Input
 with st.form("ask_form", clear_on_submit=True):
@@ -387,7 +419,8 @@ with st.form("ask_form", clear_on_submit=True):
     submitted = st.form_submit_button("Ask", type="primary")
 
 if submitted:
-    if not user_q.strip(): st.warning("Enter a question.")
+    if not user_q.strip():
+        st.warning("Enter a question.")
     else:
         log_event(st.session_state.mobile, "user", user_q)
         with st.spinner("Thinking…"):
@@ -400,4 +433,3 @@ if submitted:
         st.session_state.chat_history.append({"role": "user", "content": user_q, "ts": int(time.time())})
         st.session_state.chat_history.append({"role": "assistant", "content": ans, "ts": int(time.time())})
         st.rerun()
-
