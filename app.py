@@ -7,7 +7,7 @@ import time
 import sqlite3
 import requests
 import numpy as np
-import faiss
+import faiss_cpu as faiss
 import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
@@ -444,3 +444,4 @@ if submitted:
         st.session_state.chat_history.append({"role": "user", "content": user_q, "ts": int(time.time())})
         st.session_state.chat_history.append({"role": "assistant", "content": ans, "ts": int(time.time())})
         st.rerun()
+
