@@ -4,3 +4,4 @@ faiss-cpu
 numpy
 requests
 python-dotenv
+pandas>=2.0
