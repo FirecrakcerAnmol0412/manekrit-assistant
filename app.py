@@ -1,34 +1,22 @@
-# app.py — ManeKrit (ChromaDB, mobile login, per-number history, project picker, admin)
-# Safe dotenv import so Streamlit Cloud won't crash if python-dotenv isn't present
+# app.py — ManeKrit (ChromaDB, lazy-load KB after project selection, support embeddings.npy.gz)
+# Safe dotenv import
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-import os, re, io, json, time, sqlite3, requests, numpy as np, streamlit as st, pandas as pd
-# OpenAI client (SDK v1+). If missing, show a helpful error instead of crashing.
-try:
-    from openai import OpenAI
-except Exception as e:
-    import streamlit as st
-    st.error(
-        "The OpenAI SDK isn't available. Make sure `openai` is in requirements.txt "
-        "(e.g., `openai>=1.51.0`) and then Clear cache & Restart the app."
-    )
-    raise
-
+import os, re, io, json, gzip, time, sqlite3, requests, numpy as np, streamlit as st, pandas as pd
+from openai import OpenAI
 from typing import List, Dict, Any, Set, Optional
 
-# Vector store: ChromaDB (no FAISS)
 import chromadb
 from chromadb.config import Settings
 
 # -------------------------------
-# 0) CONFIG / SECRETS
+# CONFIG / SECRETS (use st.secrets first)
 # -------------------------------
 def get_config(name: str, default: str = "") -> str:
-    # Prefer Streamlit secrets; fallback to env (useful for local dev)
     try:
         val = st.secrets.get(name)  # type: ignore[attr-defined]
         if val:
@@ -50,54 +38,38 @@ TZ_OFFSET   = 5.5  # IST for charts
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # -------------------------------
-# 1) PERSISTENCE (SQLite)
+# DB (SQLite) — same as before
 # -------------------------------
 DB_PATH = "conversations.sqlite"
-
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             mobile TEXT NOT NULL,
             ts INTEGER NOT NULL,
-            role TEXT NOT NULL,   -- 'user' | 'assistant' | 'event'
+            role TEXT NOT NULL,
             content TEXT NOT NULL
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_conv_mobile_ts ON conversations (mobile, ts)")
-    conn.commit()
-    conn.close()
-
+    conn.commit(); conn.close()
 def log_event(mobile: str, role: str, content: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO conversations (mobile, ts, role, content) VALUES (?, ?, ?, ?)",
-        (mobile, int(time.time()), role, content),
-    )
-    conn.commit()
-    conn.close()
-
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("INSERT INTO conversations (mobile, ts, role, content) VALUES (?, ?, ?, ?)",
+              (mobile, int(time.time()), role, content))
+    conn.commit(); conn.close()
 def load_history(mobile: str) -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("SELECT role, content, ts FROM conversations WHERE mobile=? ORDER BY ts ASC", (mobile,))
-    rows = c.fetchall()
-    conn.close()
+    rows = c.fetchall(); conn.close()
     return [{"role": r, "content": t, "ts": ts} for (r, t, ts) in rows if r in ("user", "assistant")]
-
 def load_all_df() -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT id, mobile, ts, role, content FROM conversations ORDER BY ts ASC", conn)
-    conn.close()
-    return df
-
+    conn = sqlite3.connect(DB_PATH); df = pd.read_sql_query("SELECT id, mobile, ts, role, content FROM conversations ORDER BY ts ASC", conn); conn.close(); return df
 init_db()
 
 # -------------------------------
-# 2) GOOGLE DRIVE HELPERS
+# Drive helpers (download files)
 # -------------------------------
 def list_drive_files(folder_id: str, api_key: str):
     url = "https://www.googleapis.com/drive/v3/files"
@@ -109,31 +81,29 @@ def list_drive_files(folder_id: str, api_key: str):
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
     }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
+    r = requests.get(url, params=params, timeout=30); r.raise_for_status()
     return r.json().get("files", [])
 
 def find_by_name(files, name: str):
     for f in files:
-        if f.get("name") == name:
-            return f
+        if f.get("name") == name: return f
     return None
 
 @st.cache_data(show_spinner=False)
 def download_drive_file_bytes(file_id: str, api_key: str) -> bytes:
     url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
-    r = requests.get(url, params={"alt": "media", "key": api_key}, timeout=120)
-    r.raise_for_status()
+    r = requests.get(url, params={"alt":"media","key":api_key}, timeout=120); r.raise_for_status()
     return r.content
 
 # -------------------------------
-# 3) LOAD PREBUILT (meta + embeddings) AND BUILD CHROMA
+# Load prebuilt meta + embeddings (supports .npy.gz)
+# This function is NOT called until after project selection 'Continue'
 # -------------------------------
 @st.cache_resource(show_spinner=False)
-def load_chroma_collection(folder_id: str, api_key: str):
+def load_chroma_collection_from_drive(folder_id: str, api_key: str):
     files = list_drive_files(folder_id, api_key)
     meta_f = find_by_name(files, "meta.json")
-    emb_f  = find_by_name(files, "embeddings.npy")
+    emb_f  = find_by_name(files, "embeddings.npy.gz") or find_by_name(files, "embeddings.npy")
     if not meta_f or not emb_f:
         return None, None
 
@@ -141,9 +111,15 @@ def load_chroma_collection(folder_id: str, api_key: str):
     emb_bytes  = download_drive_file_bytes(emb_f["id"], api_key)
 
     meta = json.loads(meta_bytes.decode("utf-8"))
-    embeddings = np.load(io.BytesIO(emb_bytes))  # (N, dim) float32
 
-    # Build in-memory Chroma collection; we pass embeddings explicitly
+    # load embeddings (gzipped or raw)
+    if emb_f["name"].endswith(".gz"):
+        with gzip.GzipFile(fileobj=io.BytesIO(emb_bytes), mode="rb") as gz:
+            embeddings = np.load(gz)
+    else:
+        embeddings = np.load(io.BytesIO(emb_bytes))
+
+    # Build Chroma in-memory collection
     cclient = chromadb.Client(Settings(anonymized_telemetry=False, is_persistent=False))
     coll = cclient.create_collection(name="manekrit", embedding_function=None)
 
@@ -155,7 +131,7 @@ def load_chroma_collection(folder_id: str, api_key: str):
     return coll, meta
 
 # -------------------------------
-# 4) RETRIEVAL + ANSWERING
+# Retrieval + QnA (unchanged)
 # -------------------------------
 def embed_query(text: str) -> np.ndarray:
     resp = client.embeddings.create(model=EMBED_MODEL, input=text)
@@ -214,44 +190,42 @@ def answer_from_context(user_query: str, context_chunks: List[Dict[str, Any]]) -
     )
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=[{"role":"system","content":system},{"role":"user","content":user}]
     )
     return resp.choices[0].message.content
 
 # -------------------------------
-# 5) UI — ManeKrit (mobile login → project picker → chat) + Admin
+# UI — ManeKrit (mobile login → project picker → lazy KB load → chat)
 # -------------------------------
 st.set_page_config(page_title="ManeKrit", page_icon="🏠", layout="wide")
 st.markdown("<h1 style='margin-bottom:0.2rem;'>🏠 ManeKrit</h1>", unsafe_allow_html=True)
 st.markdown("<div style='color:#666;margin-bottom:1.2rem;'>Smart real estate guidance for Bengaluru buyers.</div>", unsafe_allow_html=True)
 
-# Session state
-if "authed" not in st.session_state: st.session_state.authed = False
-if "mobile" not in st.session_state: st.session_state.mobile = None
-if "chat_history" not in st.session_state: st.session_state.chat_history = []
-if "selected_projects" not in st.session_state: st.session_state.selected_projects = set()
-if "project_confirmed" not in st.session_state: st.session_state.project_confirmed = False
-if "project_names" not in st.session_state: st.session_state.project_names = []
-if "project_map" not in st.session_state: st.session_state.project_map = {}
-if "is_admin" not in st.session_state: st.session_state.is_admin = False
+# Session-state defaults
+for k, v in {
+    "authed": False, "mobile": None, "chat_history": [], "selected_projects": set(),
+    "project_confirmed": False, "project_names": [], "project_map": {}, "is_admin": False,
+    "kb_ready": False, "coll": None, "meta": None
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 def is_valid_mobile(x: str) -> bool:
     return bool(re.match(r"^\+?\d{10,13}$", x.strip()))
 
-# --- Mobile Login + Admin gate
+# --- Login (mobile) + Admin expand
 if not st.session_state.authed and not st.session_state.is_admin:
-    with st.container(border=True):
-        st.markdown("### Sign in to continue")
-        mobile = st.text_input("Mobile", placeholder="+91XXXXXXXXXX", key="login_mobile")
-        if st.button("Continue", key="login_mobile_btn", type="primary", use_container_width=True):
-            if not is_valid_mobile(mobile):
-                st.error("Please enter a valid mobile number (10–13 digits).")
-            else:
-                st.session_state.authed = True
-                st.session_state.mobile = mobile.strip()
-                st.session_state.chat_history = load_history(st.session_state.mobile)
-                log_event(st.session_state.mobile, "event", "login")
-                st.rerun()
+    st.markdown("### Sign in to continue")
+    mobile = st.text_input("Mobile", placeholder="+91XXXXXXXXXX", key="login_mobile")
+    if st.button("Continue", key="login_mobile_btn", type="primary", use_container_width=True):
+        if not is_valid_mobile(mobile):
+            st.error("Please enter a valid mobile number (10–13 digits).")
+        else:
+            st.session_state.authed = True
+            st.session_state.mobile = mobile.strip()
+            st.session_state.chat_history = load_history(st.session_state.mobile)
+            log_event(st.session_state.mobile, "event", "login")
+            st.rerun()
 
     with st.expander("Admin login"):
         pwd = st.text_input("Admin password", type="password", key="admin_pwd")
@@ -263,10 +237,9 @@ if not st.session_state.authed and not st.session_state.is_admin:
                 st.error("Invalid admin password.")
     st.stop()
 
-# --- Admin panel
+# --- Admin area (unchanged) ---
 if st.session_state.is_admin:
     tab1, tab2 = st.tabs(["📊 Admin Dashboard", "🗂️ Conversation Explorer"])
-    # Dashboard
     with tab1:
         df = load_all_df()
         if df.empty:
@@ -274,44 +247,37 @@ if st.session_state.is_admin:
         else:
             df["ts_dt"] = pd.to_datetime(df["ts"], unit="s") + pd.to_timedelta(TZ_OFFSET, unit="h")
             df["date"] = df["ts_dt"].dt.date
-            messages = len(df[df["role"].isin(["user", "assistant"])])
+            messages = len(df[df["role"].isin(["user","assistant"])])
             users = df["mobile"].nunique()
             dau = df.groupby("date")["mobile"].nunique().iloc[-1] if not df.empty else 0
             avg_msgs = round(messages / users, 2) if users else 0.0
-
-            c1, c2, c3, c4 = st.columns(4)
+            c1,c2,c3,c4 = st.columns(4)
             c1.metric("Total messages", f"{messages}")
             c2.metric("Total users", f"{users}")
             c3.metric("DAU (today)", f"{dau}")
             c4.metric("Avg msgs / user", f"{avg_msgs}")
-
-            daily_msgs = df[df["role"].isin(["user", "assistant"])].groupby("date").size().reset_index(name="messages")
+            daily_msgs = df[df["role"].isin(["user","assistant"])].groupby("date").size().reset_index(name="messages")
             daily_users = df.groupby("date")["mobile"].nunique().reset_index(name="active_users")
-
             st.markdown("#### Messages per day"); st.line_chart(daily_msgs.set_index("date"))
             st.markdown("#### Active users per day"); st.line_chart(daily_users.set_index("date"))
 
-            # Top projects from selection events
-            ev = df[df["role"] == "event"]["content"].fillna("")
+            ev = df[df["role"]=="event"]["content"].fillna("")
             sel = ev[ev.str.startswith("project_selection:")]
             if not sel.empty:
-                proj_counts = {}
+                proj_counts={}
                 for row in sel:
-                    names_str = row.split("project_selection:", 1)[1].strip()
-                    if names_str.lower().startswith("all projects"):
-                        continue
+                    names_str = row.split("project_selection:",1)[1].strip()
+                    if names_str.lower().startswith("all projects"): continue
                     for nm in [x.strip() for x in names_str.split(",") if x.strip()]:
-                        proj_counts[nm] = proj_counts.get(nm, 0) + 1
+                        proj_counts[nm] = proj_counts.get(nm,0)+1
                 if proj_counts:
                     proj_df = pd.DataFrame(sorted(proj_counts.items(), key=lambda x: x[1], reverse=True),
-                                           columns=["project", "selections"])
-                    st.markdown("#### Top selected projects")
-                    st.bar_chart(proj_df.set_index("project"))
+                                           columns=["project","selections"])
+                    st.markdown("#### Top selected projects"); st.bar_chart(proj_df.set_index("project"))
                 else:
                     st.info("No explicit project selections yet.")
             else:
                 st.info("No project selection events yet.")
-    # Explorer
     with tab2:
         df = load_all_df()
         if df.empty:
@@ -328,42 +294,37 @@ if st.session_state.is_admin:
             with cols[2]:
                 min_d, max_d = df["ts_dt"].dt.date.min(), df["ts_dt"].dt.date.max()
                 f_to = st.date_input("To", value=max_d)
-
             mask = (df["ts_dt"].dt.date >= f_from) & (df["ts_dt"].dt.date <= f_to)
-            if f_mobile != "(all)":
-                mask &= (df["mobile"] == f_mobile)
-            fdf = df[mask].sort_values("ts_dt")[["ts_dt", "mobile", "role", "content"]]
-            st.markdown("#### Messages")
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
-
+            if f_mobile != "(all)": mask &= (df["mobile"] == f_mobile)
+            fdf = df[mask].sort_values("ts_dt")[["ts_dt","mobile","role","content"]]
+            st.markdown("#### Messages"); st.dataframe(fdf, use_container_width=True, hide_index=True)
             csv = fdf.to_csv(index=False).encode("utf-8")
             st.download_button("Download CSV", data=csv, file_name="manekrit_conversations.csv", mime="text/csv")
     st.stop()
 
-# --- User flow (authenticated) ---
-# Guard config
-missing = []
-if not OPENAI_API_KEY:   missing.append("OPENAI_API_KEY")
-if not GDRIVE_API_KEY:   missing.append("GDRIVE_API_KEY")
-if not GDRIVE_FOLDER_ID: missing.append("GDRIVE_FOLDER_ID")
-if missing:
-    st.error("Configuration missing. Please set: " + ", ".join(missing))
-    st.stop()
-
-# Load Chroma collection
-with st.spinner("Preparing knowledge base…"):
-    coll, meta = load_chroma_collection(GDRIVE_FOLDER_ID, GDRIVE_API_KEY)
-if coll is None or meta is None:
-    st.error("Prebuilt files not found. Upload 'meta.json' and 'embeddings.npy' to Drive.")
-    st.stop()
-
-# Build project list/map (strip .pdf for display)
+# --- User flow: project picker first (no heavy KB load) ---
 if not st.session_state.project_names:
-    file_names = sorted({m["file"] for m in meta})
-    st.session_state.project_map = {fn: os.path.splitext(fn)[0] for fn in file_names}
-    st.session_state.project_names = file_names
+    # if meta not loaded yet, we still can build project list once we download meta.json lazily...
+    # But to show project names we need meta.json. We'll fetch only meta.json (small) when showing picker.
+    # Try to download meta.json quickly (small file). If unavailable, show message.
+    try:
+        files = list_drive_files(GDRIVE_FOLDER_ID, GDRIVE_API_KEY)
+        meta_f = find_by_name(files, "meta.json")
+        if meta_f:
+            meta_bytes = download_drive_file_bytes(meta_f["id"], GDRIVE_API_KEY)
+            meta_preview = json.loads(meta_bytes.decode("utf-8"))
+            # create project map from meta_preview but do not build embeddings collection yet
+            file_names = sorted({m["file"] for m in meta_preview})
+            st.session_state.project_map = {fn: os.path.splitext(fn)[0] for fn in file_names}
+            st.session_state.project_names = file_names
+        else:
+            st.error("meta.json not found in Drive. Upload meta.json + embeddings.npy.gz and restart.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Could not read meta.json from Drive: {e}")
+        st.stop()
 
-# Project picker (until confirmed)
+# Show project picker UI
 if not st.session_state.project_confirmed:
     st.markdown("### Which projects are you considering right now?")
     st.caption("Select one or more, or choose **None of the above** to ask general questions.")
@@ -373,35 +334,46 @@ if not st.session_state.project_confirmed:
         sel = internal in st.session_state.selected_projects
         label = f"✅ {disp}" if sel else disp
         if cols[i % 3].button(label, key=f"proj_{i}", use_container_width=True):
-            if sel:
-                st.session_state.selected_projects.remove(internal)
+            if sel: st.session_state.selected_projects.remove(internal)
             else:
                 if "NONE_OF_THE_ABOVE" in st.session_state.selected_projects:
                     st.session_state.selected_projects.remove("NONE_OF_THE_ABOVE")
                 st.session_state.selected_projects.add(internal)
     st.divider()
-    c1, c2 = st.columns([1, 1])
+    c1, c2 = st.columns([1,1])
     with c1:
         none_sel = "NONE_OF_THE_ABOVE" in st.session_state.selected_projects
         none_label = "✅ None of the above" if none_sel else "None of the above"
         if st.button(none_label, key="proj_none", type="secondary", use_container_width=True):
-            if none_sel:
-                st.session_state.selected_projects.remove("NONE_OF_THE_ABOVE")
-            else:
-                st.session_state.selected_projects = {"NONE_OF_THE_ABOVE"}
+            if none_sel: st.session_state.selected_projects.remove("NONE_OF_THE_ABOVE")
+            else: st.session_state.selected_projects = {"NONE_OF_THE_ABOVE"}
     with c2:
         if st.button("Continue", key="confirm_projects", type="primary", use_container_width=True):
+            # load heavy KB resource here (lazy)
+            with st.spinner("Preparing knowledge base…"):
+                coll, meta = load_chroma_collection_from_drive(GDRIVE_FOLDER_ID, GDRIVE_API_KEY)
+            if coll is None or meta is None:
+                st.error("Prebuilt files not found. Upload 'meta.json' and 'embeddings.npy.gz' (or embeddings.npy) to Drive.")
+                st.stop()
+            st.session_state.coll = coll
+            st.session_state.meta = meta
+            st.session_state.kb_ready = True
             st.session_state.project_confirmed = True
-            chosen = (
-                "All projects"
-                if "NONE_OF_THE_ABOVE" in st.session_state.selected_projects or not st.session_state.selected_projects
-                else ", ".join([st.session_state.project_map.get(fn, fn) for fn in sorted(st.session_state.selected_projects)])
-            )
+            chosen = ("All projects" if "NONE_OF_THE_ABOVE" in st.session_state.selected_projects or not st.session_state.selected_projects
+                      else ", ".join([st.session_state.project_map.get(fn, fn) for fn in sorted(st.session_state.selected_projects)]))
             log_event(st.session_state.mobile, "event", f"project_selection: {chosen}")
             st.rerun()
     st.stop()
 
-# Top bar (filter + Change selection)
+# After confirmation, ensure KB is loaded in session_state
+if not st.session_state.kb_ready or st.session_state.coll is None:
+    st.error("Knowledge base not loaded. Click 'Change selection' and press Continue to load it.")
+    st.stop()
+
+coll = st.session_state.coll
+meta = st.session_state.meta
+
+# Top bar + change selection
 left, right = st.columns([0.7, 0.3])
 with left:
     if "NONE_OF_THE_ABOVE" in st.session_state.selected_projects or not st.session_state.selected_projects:
@@ -416,14 +388,12 @@ with right:
 
 st.subheader("Chat")
 
-# Past messages
+# Show past messages
 for chat in st.session_state.chat_history:
-    if chat["role"] == "user":
-        st.markdown(f"**You:** {chat['content']}")
-    elif chat["role"] == "assistant":
-        st.markdown(f"**Advisor:** {chat['content']}")
+    if chat["role"] == "user": st.markdown(f"**You:** {chat['content']}")
+    elif chat["role"] == "assistant": st.markdown(f"**Advisor:** {chat['content']}")
 
-# Input
+# Input form
 with st.form("ask_form", clear_on_submit=True):
     user_q = st.text_input("Type your question here…", key="user_q_input")
     submitted = st.form_submit_button("Ask", type="primary")
@@ -443,4 +413,3 @@ if submitted:
         st.session_state.chat_history.append({"role": "user", "content": user_q, "ts": int(time.time())})
         st.session_state.chat_history.append({"role": "assistant", "content": ans, "ts": int(time.time())})
         st.rerun()
-
